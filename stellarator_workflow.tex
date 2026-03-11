@@ -15,7 +15,7 @@
 \setlist[itemize]{leftmargin=*}
 \setlist[enumerate]{leftmargin=*}
 
-\title{A Non-Expert Guide to the Stellarator Design Workflow}
+\title{A Guide to the Stellarator Design Workflow}
 \author{stellarator\_workflow repository draft}
 \date{March 11, 2026}
 
@@ -23,22 +23,39 @@
 \maketitle
 
 \begin{abstract}
-This document explains, in plain language but with exact governing equations,
-how a modern stellarator workflow turns a prescribed plasma boundary and profile
-guesses into transport predictions, fusion power estimates, and design metrics.
-The focus is the practical code chain built around VMEC or DESC for
-equilibrium, BOOZ\_XFORM for Boozer coordinates, NEO / SFINCS / MONKES for
-neoclassical and orbit-space metrics, GENE or GX for turbulence, and Trinity3D
-or NEOPAX for profile evolution. The goal is not only to explain the physics
-for non-specialists, but also to clarify the software interfaces that would be
-needed to containerize the full workflow as a reproducible black box.
+This document explains how a modern stellarator workflow turns a prescribed
+plasma boundary and profile guesses into equilibrium solutions, transport
+predictions, fusion-power estimates, and optimization metrics. The focus is the
+practical code chain built around VMEC or DESC for equilibrium, BOOZ\_XFORM
+for Boozer coordinates, NEO / SFINCS / MONKES for neoclassical and orbit-space
+metrics, GENE or GX for turbulence, and Trinity3D or NEOPAX for profile
+evolution. The main objective is to make the data hand-offs between these codes
+explicit, so that the physics workflow can also be understood as a software
+workflow suitable for reproducible, containerized execution.
 \end{abstract}
 
 \tableofcontents
 
-\section{Why this workflow exists}
+\section{Fusion energy, stellarators, and optimization}
 
-Designing a stellarator is not a single computation. It is an iterative chain:
+Fusion energy aims to extract useful power from reactions between light nuclei,
+most commonly deuterium and tritium. In a magnetic-confinement concept, the
+plasma must be kept hot, dense, and well confined long enough for fusion
+heating to offset the losses. Stellarators are one route to that goal: they
+use fully three-dimensional magnetic fields generated mainly by external coils,
+which reduces reliance on a large toroidal plasma current and makes steady-state
+operation especially attractive \citep{Helander2014,Endler2021}.
+
+That same three-dimensional freedom is also what makes stellarator design a
+high-dimensional optimization problem. The boundary shape that creates nested
+flux surfaces also changes trapped-particle orbits, neoclassical transport,
+turbulence, bootstrap current, and MHD stability. In other words, a stellarator
+is not judged only by whether an equilibrium exists; it is judged by how that
+equilibrium performs after the whole transport and power-balance loop is
+considered \citep{LandremanPaul2022,Kim2024TurbulenceOpt,BanonNavarro2023}.
+
+Designing a stellarator is therefore not a single computation. It is an
+iterative chain:
 
 \begin{enumerate}
   \item choose a plasma boundary and rough pressure / current profile,
@@ -50,12 +67,17 @@ Designing a stellarator is not a single computation. It is an iterative chain:
   \item evaluate whether the resulting device has acceptable confinement, transport, and fusion power.
 \end{enumerate}
 
-For a non-expert, the most important conceptual point is that the profile used
-to \emph{start} the equilibrium solve is usually not the profile used to quote
-the device's final performance. The final performance comes from the
-transport-consistent profiles after the loop closes.
+The most important conceptual point is that the profile used to \emph{start}
+the equilibrium solve is usually not the profile used to quote the device's
+final performance. The final performance comes from the transport-consistent
+profiles after the loop closes.
 
-\section{What goes in, and what comes out}
+\section{Inputs, state variables, and final performance metrics}
+
+The workflow begins with geometry and profile inputs, but it ends with a much
+broader set of performance metrics. The role of the intermediate codes is to
+propagate information from one stage of physics to the next while preserving
+enough detail to support optimization.
 
 We assume stellarator symmetry, so the boundary can be written using only
 cosine $R_{mn}$ and sine $Z_{mn}$ terms:
@@ -708,6 +730,13 @@ The workflow described here is not hypothetical. Several published studies
 already implement large parts of it:
 
 \begin{itemize}
+  \item \textbf{Device-scale context: Wendelstein 7-X.}
+  Wendelstein 7-X is the clearest experimental example of an optimized
+  stellarator built around reduced neoclassical transport, good confinement,
+  and steady-state operation. While it is not itself a single ``workflow
+  paper'', recent operation summaries show the device-level goals that this
+  code chain is trying to predict and optimize \citep{Endler2021}.
+
   \item \textbf{Precise quasi-symmetry optimization.}
   Landreman and Paul optimized stellarator magnetic fields for extremely
   precise quasi-symmetry, providing an archetypal example of equilibrium plus
