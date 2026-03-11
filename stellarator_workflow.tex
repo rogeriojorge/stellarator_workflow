@@ -1,0 +1,758 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+\usepackage{amsmath,amssymb,mathtools}
+\usepackage{booktabs,longtable,tabularx,array}
+\usepackage{enumitem}
+\usepackage[numbers,sort&compress]{natbib}
+\usepackage[colorlinks=true,linkcolor=blue,citecolor=blue,urlcolor=blue]{hyperref}
+
+\setlength{\parskip}{0.6em}
+\setlength{\parindent}{0pt}
+\setlist[itemize]{leftmargin=*}
+\setlist[enumerate]{leftmargin=*}
+
+\title{A Non-Expert Guide to the Stellarator Design Workflow}
+\author{stellarator\_workflow repository draft}
+\date{March 11, 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+This document explains, in plain language but with exact governing equations,
+how a modern stellarator workflow turns a prescribed plasma boundary and profile
+guesses into transport predictions, fusion power estimates, and design metrics.
+The focus is the practical code chain built around VMEC or DESC for
+equilibrium, BOOZ\_XFORM for Boozer coordinates, NEO / SFINCS / MONKES for
+neoclassical and orbit-space metrics, GENE or GX for turbulence, and Trinity3D
+or NEOPAX for profile evolution. The goal is not only to explain the physics
+for non-specialists, but also to clarify the software interfaces that would be
+needed to containerize the full workflow as a reproducible black box.
+\end{abstract}
+
+\tableofcontents
+
+\section{Why this workflow exists}
+
+Designing a stellarator is not a single computation. It is an iterative chain:
+
+\begin{enumerate}
+  \item choose a plasma boundary and rough pressure / current profile,
+  \item solve the three-dimensional magnetohydrodynamic equilibrium,
+  \item transform the equilibrium into coordinates suitable for transport and orbit calculations,
+  \item compute neoclassical and turbulent transport,
+  \item evolve the density and temperature profiles,
+  \item feed the updated pressure and current back into the equilibrium calculation,
+  \item evaluate whether the resulting device has acceptable confinement, transport, and fusion power.
+\end{enumerate}
+
+For a non-expert, the most important conceptual point is that the profile used
+to \emph{start} the equilibrium solve is usually not the profile used to quote
+the device's final performance. The final performance comes from the
+transport-consistent profiles after the loop closes.
+
+\section{What goes in, and what comes out}
+
+We assume stellarator symmetry, so the boundary can be written using only
+cosine $R_{mn}$ and sine $Z_{mn}$ terms:
+
+\begin{equation}
+R(\theta,\phi) = \sum_{m,n} R_{mn}\cos\!\left(m\theta - nN_{\mathrm{fp}}\phi\right),
+\end{equation}
+
+\begin{equation}
+Z(\theta,\phi) = \sum_{m,n} Z_{mn}\sin\!\left(m\theta - nN_{\mathrm{fp}}\phi\right).
+\end{equation}
+
+In VMEC input files these are usually represented as \texttt{RBC(m,n)} and
+\texttt{ZBS(m,n)}. In DESC the same physical surface is stored in its own
+spectral basis.
+
+The remaining inputs are profile guesses:
+
+\begin{itemize}
+  \item a pressure profile $p$,
+  \item either rotational transform $\iota$ or a current profile,
+  \item a total toroidal flux / magnetic-field scale.
+\end{itemize}
+
+The converged output of the full workflow is not just ``an equilibrium''. It is
+the combination of:
+
+\begin{itemize}
+  \item geometry metrics: major radius $R$, minor radius $a$, aspect ratio $R/a$, volume, $\beta$, $\iota$,
+  \item Boozer-space metrics: symmetry-breaking harmonics, $I(\psi)$, $G(\psi)$, trapped-particle proxies,
+  \item neoclassical metrics: $\epsilon_{\mathrm{eff}}$, bootstrap current, ambipolar $E_r$, neoclassical particle and heat fluxes,
+  \item turbulence metrics: linear growth rates, nonlinear heat fluxes, stiffness,
+  \item whole-device metrics: transport-consistent $n(r)$ and $T(r)$, fusion power, auxiliary power, and $Q=P_{\mathrm{fus}}/P_{\mathrm{aux}}$.
+\end{itemize}
+
+When the final species profiles are available, the fusion power is computed from
+the transport-consistent pressure and composition:
+
+\begin{equation}
+P_{\mathrm{fus}} = \int dV \; n_D n_T \langle \sigma v \rangle_{DT} E_{DT},
+\end{equation}
+
+with $E_{DT}\approx 17.6$ MeV and the thermal reactivity
+$\langle \sigma v \rangle_{DT}$ typically evaluated using the Bosch-Hale
+parametrization \citep{BoschHale1992}.
+
+\section{The workflow as a data pipeline}
+
+Table~\ref{tab:contracts} summarizes the software contracts in the order they
+usually appear in a design loop.
+
+\begin{longtable}{p{0.13\linewidth}p{0.19\linewidth}p{0.21\linewidth}p{0.21\linewidth}p{0.19\linewidth}}
+\caption{Core data contracts in a stellarator design workflow.}
+\label{tab:contracts}\\
+\toprule
+Stage & Codes & Typical inputs & Typical outputs & Downstream role / direct objective \\
+\midrule
+\endfirsthead
+\toprule
+Stage & Codes & Typical inputs & Typical outputs & Downstream role / direct objective \\
+\midrule
+\endhead
+Equilibrium &
+VMEC, vmec\_jax, DESC &
+boundary Fourier coefficients, pressure coefficients, iota or current coefficients, toroidal flux &
+$wout$ or HDF5 equilibrium, $R$, $a$, aspect ratio, volume, $\beta$, $\iota$, field harmonics &
+feeds everything downstream; geometry metrics are also direct objectives \\
+
+Boozer transform &
+BOOZ\_XFORM, booz\_xform\_jax, DESC Boozer utilities &
+VMEC- or DESC-like equilibrium &
+\texttt{boozmn}, Boozer $B_{mn}$, Boozer geometry, $I(\psi)$, $G(\psi)$, angle shifts &
+feeds NEO, SFINCS, MONKES, some gyrokinetic geometry modules; symmetry-breaking spectrum is a direct objective \\
+
+Orbit / ripple diagnostics &
+NEO, NEO\_JAX &
+Boozer Fourier data, surface list, control file &
+$\epsilon_{\mathrm{eff}}^{3/2}$, trapped-particle class contributions, reference radii &
+mostly a screening metric or optimization objective; usually not directly advanced by a transport solver \\
+
+Neoclassical transport &
+SFINCS, sfincs\_jax &
+Boozer geometry, species gradients, $E_r$ guess, collision model &
+particle flux, heat flux, bootstrap current, $E_r$, $\Phi_1$, transport matrices &
+can feed a transport solver directly; bootstrap current and pressure updates can be sent back to equilibrium \\
+
+Reduced neoclassical stage &
+MONKES, NEOPAX &
+Boozer or DESC geometry, Maxwellians, $E_r$, monoenergetic scan database &
+$D_{ij}(r,\nu,E_r)$, thermal $L_{ij}$ matrices, ambipolar $E_r$, reduced transport evolution &
+MONKES feeds NEOPAX; both can be used in optimization loops when full SFINCS is too expensive \\
+
+Turbulence &
+GENE, GENE-3D, GX, SPECTRAX-GK &
+geometry, species profiles and gradients, collisions, electromagnetic parameters &
+growth rates, frequencies, nonlinear heat and particle fluxes, spectra &
+heat fluxes are both direct objectives and inputs to global transport solvers \\
+
+Global transport &
+Trinity3D, NEOPAX &
+initial profiles, source models, geometry, neoclassical and turbulent fluxes &
+updated $n(r)$, $T(r)$, $p(r)$, $E_r(r)$, fusion-power metrics, profile histories &
+closes the loop by producing the new pressure and often new current / bootstrap information \\
+\bottomrule
+\end{longtable}
+
+Two practical distinctions are worth making explicitly:
+
+\begin{itemize}
+  \item $\epsilon_{\mathrm{eff}}$ is extremely useful for optimization, but it is not normally the quantity that Trinity3D advances.
+  \item nonlinear heat flux from GX or GENE is both a design objective and a direct transport input.
+\end{itemize}
+
+\section{Code-by-code details}
+
+\subsection{VMEC and vmec\_jax: ideal-MHD equilibrium}
+
+\paragraph{What these codes do.}
+VMEC solves the three-dimensional ideal-MHD equilibrium for a prescribed
+boundary and prescribed pressure / current data. The JAX implementation
+\texttt{vmec\_jax} is designed to preserve the same physics and very similar
+input / output contracts while enabling differentiation and JIT execution
+\citep{VMECRepo,VMECJaxRepo}.
+
+\paragraph{Governing equations.}
+The equilibrium is defined by
+\begin{equation}
+\nabla p = \mathbf{J}\times\mathbf{B},
+\qquad
+\nabla\cdot\mathbf{B}=0,
+\qquad
+\mathbf{J}=\frac{1}{\mu_0}\nabla\times\mathbf{B}.
+\end{equation}
+
+VMEC uses straight-field-line coordinates. Introducing
+\begin{equation}
+u = \theta + \lambda(s,\theta,\zeta),
+\qquad
+\frac{du}{d\zeta} = \iota(s),
+\end{equation}
+the equilibrium is found as a stationary point of the ideal-MHD energy
+functional \citep{HirshmanWhitson1983}:
+\begin{equation}
+W = \frac{1}{(2\pi)^2}\int \left(\frac{B^2}{2} + \frac{p}{\gamma-1}\right)dV.
+\end{equation}
+
+In VMEC's flux-coordinate representation, the contravariant field components
+used in the implementation are \citep{VMECJaxRepo}:
+\begin{equation}
+B^\zeta = \frac{\Phi'(s) + \mathrm{lamscale}\,\partial_\theta \lambda}
+{\mathrm{signgs}\,\sqrt{g}\,2\pi},
+\end{equation}
+\begin{equation}
+B^\theta = \frac{\chi'(s) - \mathrm{lamscale}\,\partial_\zeta \lambda}
+{\mathrm{signgs}\,\sqrt{g}\,2\pi}.
+\end{equation}
+
+\paragraph{Inputs.}
+The legacy VMEC input contract is typically:
+\begin{itemize}
+  \item boundary coefficients \texttt{RBC(m,n)} and \texttt{ZBS(m,n)},
+  \item pressure coefficients \texttt{AM},
+  \item either iota coefficients \texttt{AI} or current coefficients \texttt{AC},
+  \item a flux scale such as \texttt{PHIEDGE},
+  \item grid / resolution / convergence controls.
+\end{itemize}
+
+\paragraph{Outputs.}
+The standard product is \texttt{wout\_*.nc}, which contains the geometry and
+diagnostic scalars needed by downstream codes: aspect ratio, major radius,
+minor radius, volume, total beta, iota, pressure profiles, field harmonics,
+Jacobian information, and real-space geometry on flux surfaces.
+
+\paragraph{How these outputs are used.}
+The equilibrium is the universal upstream state. BOOZ\_XFORM uses it directly,
+GX geometry utilities derive flux-tube metrics from it, and transport solvers
+use its flux-surface geometry. Many device objectives, such as target aspect
+ratio or target volume, are already available at this stage.
+
+\subsection{DESC: differentiable pseudo-spectral equilibrium}
+
+\paragraph{What DESC does.}
+DESC solves the same physical equilibrium problem, but in an inverse
+pseudo-spectral formulation designed for optimization and automatic
+differentiation \citep{DudtKolemen2020,Panici2023,Conlin2023,Dudt2023QS,DESCRepo}.
+
+\paragraph{Governing equations.}
+DESC represents the magnetic field in flux coordinates $(\rho,\theta,\zeta)$ as
+\begin{equation}
+\mathbf{B}
+=
+\frac{\partial_\rho \psi}{2\pi\sqrt{g}}
+\left[
+\left(\iota - \frac{\partial \lambda}{\partial \zeta}\right)\mathbf{e}_\theta
++
+\left(1 + \frac{\partial \lambda}{\partial \theta}\right)\mathbf{e}_\zeta
+\right].
+\end{equation}
+
+The current density follows from Ampere's law:
+\begin{equation}
+J^\rho = \frac{\partial_\theta B_\zeta - \partial_\zeta B_\theta}{\mu_0\sqrt{g}},
+\qquad
+J^\theta = \frac{\partial_\zeta B_\rho - \partial_\rho B_\zeta}{\mu_0\sqrt{g}},
+\qquad
+J^\zeta = \frac{\partial_\rho B_\theta - \partial_\theta B_\rho}{\mu_0\sqrt{g}}.
+\end{equation}
+
+Force balance is
+\begin{equation}
+\mathbf{F}\equiv\mathbf{J}\times\mathbf{B}-\nabla p = 0.
+\end{equation}
+In practice DESC solves a collocated nonlinear system in radial and helical
+components of the force residual.
+
+\paragraph{Inputs and outputs.}
+DESC accepts its own input format or imported VMEC inputs. It requires the
+boundary, pressure coefficients, iota or current coefficients, and toroidal
+flux. It outputs an HDF5 equilibrium together with a wide set of geometry and
+optimization diagnostics.
+
+\paragraph{How DESC fits in the workflow.}
+DESC can replace VMEC as the equilibrium engine, and it is especially useful
+when the workflow is part of a differentiable optimization loop. DESC can also
+compute several geometry objectives directly, reducing the number of external
+post-processing steps needed during optimization.
+
+\subsection{BOOZ\_XFORM and booz\_xform\_jax: VMEC to Boozer coordinates}
+
+\paragraph{What these codes do.}
+Boozer coordinates are the standard coordinate system for much of stellarator
+neoclassical analysis. BOOZ\_XFORM converts a VMEC-like equilibrium into the
+Boozer representation \citep{Boozer1983,BoozXformRepo,BoozXformJaxRepo}.
+
+\paragraph{Governing equations.}
+Boozer coordinates satisfy
+\begin{equation}
+\mathbf{B}
+=
+\nabla\psi\times\nabla\theta_B
++
+\iota(\psi)\nabla\zeta_B\times\nabla\psi
+=
+\beta\nabla\psi + I(\psi)\nabla\theta_B + G(\psi)\nabla\zeta_B.
+\end{equation}
+
+Let $\zeta_0$ and $\theta_0$ denote the original angle coordinates and define
+\begin{equation}
+\zeta_B = \zeta_0 + \nu.
+\end{equation}
+Then the Boozer poloidal angle is
+\begin{equation}
+\theta_B = \theta_0 + \lambda + \iota\nu.
+\end{equation}
+
+The angle-shift field $\nu$ is determined by the covariant field components:
+\begin{equation}
+B_{\theta_0}
+=
+\left(1+\frac{\partial\lambda}{\partial\theta_0}\right)I
++
+(G+\iota I)\frac{\partial\nu}{\partial\theta_0},
+\end{equation}
+\begin{equation}
+B_{\zeta_0}
+=
+G + I\frac{\partial\lambda}{\partial\zeta_0}
++
+(G+\iota I)\frac{\partial\nu}{\partial\zeta_0}.
+\end{equation}
+
+The implementation summarized in the BOOZ\_XFORM theory note expresses this as
+\begin{equation}
+\nu = \frac{w - I\lambda}{G+\iota I},
+\end{equation}
+where the Fourier coefficients of $w$ are reconstructed from the original
+covariant field harmonics.
+
+\paragraph{Inputs and outputs.}
+The standard inputs are a VMEC \texttt{wout} file and a requested Boozer
+resolution. The standard output is \texttt{boozmn\_*.nc}, containing Boozer
+harmonics such as:
+\begin{itemize}
+  \item \texttt{bmnc\_b}: $|B|$ in Boozer coordinates,
+  \item \texttt{rmnc\_b}, \texttt{zmns\_b}: geometry in Boozer coordinates,
+  \item \texttt{pmns\_b}: toroidal angle shift,
+  \item \texttt{gmn\_b}: Jacobian harmonics,
+  \item \texttt{buco\_b}, \texttt{bvco\_b}: Boozer currents.
+\end{itemize}
+
+\paragraph{How these outputs are used.}
+NEO and SFINCS typically expect Boozer-space data. The Boozer spectrum is also
+one of the cleanest direct measures of quasi-symmetry.
+
+\subsection{NEO and NEO\_JAX: effective ripple in the $1/\nu$ regime}
+
+\paragraph{What these codes do.}
+NEO evaluates effective helical ripple and related trapped-particle quantities
+from Boozer-coordinate equilibria \citep{Nemov1999,NEORepo,NEOJaxRepo}.
+
+\paragraph{Governing equations.}
+The field-line ODE accumulates the integrals
+\begin{equation}
+y_2 = \int d\phi\,B^{-2},
+\qquad
+y_3 = \int d\phi\,|\nabla\psi|B^{-2},
+\qquad
+y_4 = \int d\phi\,K_G B^{-3},
+\end{equation}
+along with pitch-angle dependent trapped-particle integrals such as
+\begin{equation}
+I_f = \int d\phi\,\sqrt{1-\frac{B}{B_0\eta}}\,B^{-2},
+\end{equation}
+\begin{equation}
+H_f = \int d\phi\,\sqrt{1-\frac{B}{B_0\eta}}
+\left(\frac{4}{B/B_0} - \frac{1}{\eta}\right)\frac{K_G}{\sqrt{\eta}}B^{-2}.
+\end{equation}
+
+For each trapped-particle class,
+\begin{equation}
+\epsilon_{\mathrm{eff}}^{3/2}(m)
+=
+C_\epsilon \frac{y_2}{y_3^2}\,\mathrm{BigInt}(m),
+\qquad
+C_\epsilon=\frac{\pi R_0^2 \Delta\eta}{8\sqrt{2}}.
+\end{equation}
+The total \texttt{epstot} is the sum over classes.
+
+\paragraph{Inputs and outputs.}
+The usual inputs are \texttt{boozmn\_*.nc} and a \texttt{neo\_in.*} control
+file. The output \texttt{neo\_out.*} contains $\epsilon_{\mathrm{eff}}$,
+surface radii, iota, and optional current-related diagnostics.
+
+\paragraph{How these outputs are used.}
+These quantities are often used as optimization metrics or rapid screening
+diagnostics. They usually do not directly enter a profile evolution equation in
+Trinity3D.
+
+\subsection{SFINCS and sfincs\_jax: full neoclassical drift-kinetic transport}
+
+\paragraph{What these codes do.}
+SFINCS solves the stellarator neoclassical drift-kinetic equation with realistic
+collisions and, optionally, a poloidally varying electrostatic potential
+\citep{Landreman2014SFINCS,Mollen2018,SFINCSRepo,SFINCSJaxRepo}.
+
+\paragraph{Governing equations.}
+One common form of the first-order kinetic equation solved by SFINCS is
+\begin{align}
+\left(
+v_\parallel\mathbf{b}
++
+\frac{d\Phi_0}{dr}\frac{\mathbf{B}\times\nabla r}{B^2}
+\right)\cdot\nabla f_{s1}
++
+\left[
+-\frac{(1-\xi^2)v}{2B}\nabla_\parallel B + \cdots
+\right]\frac{\partial f_{s1}}{\partial \xi}
+- (\mathbf{v}_{ms}\cdot\nabla r)\frac{Z_s e}{2T_s x_s}\frac{d\Phi_0}{dr}\frac{\partial f_{s1}}{\partial x_s}
+\nonumber\\
++
+(\mathbf{v}_{ms}\cdot\nabla r)
+\left[
+\frac{1}{n_s}\frac{dn_s}{dr}
++
+\frac{Z_s e}{T_s}\frac{d\Phi_0}{dr}
++
+\left(x_s^2-\frac{3}{2}\right)\frac{1}{T_s}\frac{dT_s}{dr}
+\right]f_{sM}
+=
+C_s[f_{s1}] + S_s.
+\end{align}
+
+The linearized collision operator is
+\begin{equation}
+C_s[f_s] = \sum_b C_{sb}^l[f_s,f_b],
+\qquad
+C_{ab}^l = C_{ab}^L + C_{ab}^E + C_{ab}^F.
+\end{equation}
+
+When $\Phi_1$ is included, the system is coupled to quasineutrality:
+\begin{equation}
+\lambda + \sum_s Z_s\int d^3v\,(f_{s0}+f_{s1}) = 0,
+\end{equation}
+together with moment and gauge constraints such as $\langle\Phi_1\rangle=0$.
+
+\paragraph{Inputs.}
+SFINCS typically needs:
+\begin{itemize}
+  \item Boozer geometry (from \texttt{boozmn} or \texttt{.bc}),
+  \item species masses, charges, densities, temperatures, and radial gradients,
+  \item a radial electric-field guess,
+  \item collision-operator and numerical-resolution choices.
+\end{itemize}
+
+\paragraph{Outputs.}
+The standard output file \texttt{sfincsOutput.h5} includes particle flux, heat
+flux, bootstrap current, flow moments, transport matrices, and optional
+$\Phi_1$ diagnostics.
+
+\paragraph{How these outputs are used.}
+In a reduced workflow, SFINCS can directly provide the neoclassical fluxes used
+in a global transport solve. Bootstrap current and ambipolar $E_r$ can also be
+fed back to the equilibrium stage.
+
+\subsection{MONKES: monoenergetic neoclassical coefficients}
+
+\paragraph{What MONKES does.}
+MONKES is a fast solver for monoenergetic neoclassical transport coefficients,
+designed to play a role similar to DKES but with improved modern numerics
+\citep{Escoto2024MONKES,MONKESRepo}.
+
+\paragraph{Governing equations.}
+In the JAX port used here, the Legendre-expanded pitch-angle operators are
+\begin{equation}
+L_k(f)=\frac{k}{2k-1}\left[\mathbf{b}\cdot\nabla f + \frac{k-1}{2}\frac{\mathbf{b}\cdot\nabla B}{B}f\right],
+\end{equation}
+\begin{equation}
+U_k(f)=\frac{k+1}{2k+3}\left[\mathbf{b}\cdot\nabla f - \frac{k+2}{2}\frac{\mathbf{b}\cdot\nabla B}{B}f\right],
+\end{equation}
+\begin{equation}
+D_k(f)= -\frac{\hat E_r}{\psi_r\langle B^2\rangle}\mathbf{B}\times\nabla\psi\cdot\nabla f + \frac{k(k+1)}{2}\hat\nu f.
+\end{equation}
+
+The monoenergetic coefficients are then assembled from flux-surface averages of
+the solved response:
+\begin{equation}
+D_{ij} =
+\begin{pmatrix}
+D_{11} & D_{12} & D_{13}\\
+D_{21} & D_{22} & D_{23}\\
+D_{31} & D_{32} & D_{33}
+\end{pmatrix}.
+\end{equation}
+
+\paragraph{Inputs and outputs.}
+The code takes a single-surface field, species Maxwellians, a radial electric
+field, a speed, and numerical resolution. The main output is $D_{ij}$, together
+with the perturbed distribution and source vectors.
+
+\paragraph{How MONKES fits in the workflow.}
+Its main downstream role is the creation of the database
+$D_{ij}(r,\nu,E_r)$ for NEOPAX.
+
+\subsection{GENE, GENE-3D, GX, and SPECTRAX-GK: turbulent transport}
+
+\paragraph{What these codes do.}
+These codes solve the gyrokinetic equations, which are the standard reduced
+kinetic model for low-frequency plasma turbulence. GENE and GENE-3D are
+high-fidelity grid-based Eulerian tools; GX uses a GPU-native
+Fourier--Hermite--Laguerre representation \citep{Gorler2011GENE,Merz2012GENE,Xanthopoulos2020GENE3D,Mandell2018,Mandell2024GX,GENEWebsite,GXRepo,SpectraxGKRepo}.
+
+\paragraph{Governing equations.}
+A generic $\delta f$ gyrokinetic equation can be written
+\begin{equation}
+\frac{\partial h_s}{\partial t}
++
+v_\parallel\mathbf{b}\cdot\nabla h_s
++
+\mathbf{v}_{Ds}\cdot\nabla h_s
++
+\mathbf{v}_E\cdot\nabla h_s
+-
+C[h_s]
+=
+-\frac{Z_s e F_{Ms}}{T_s}\frac{\partial\langle\chi\rangle}{\partial t}
+-
+\mathbf{v}_\chi\cdot\nabla F_{Ms},
+\end{equation}
+closed by quasineutrality and, for electromagnetic calculations, the
+appropriate field equations.
+
+GX represents velocity space spectrally:
+\begin{equation}
+h_s =
+\sum_{\ell,m,k_x,k_y}\hat h_{s,\ell,m}(z,t)
+e^{i(k_x x + k_y y)}
+H_m\!\left(\frac{v_\parallel}{v_{ts}}\right)
+L_\ell\!\left(\frac{v_\perp^2}{v_{ts}^2}\right)F_{Ms}.
+\end{equation}
+
+\paragraph{Inputs.}
+The normal inputs are:
+\begin{itemize}
+  \item magnetic geometry, commonly derived from VMEC,
+  \item local profiles and gradients,
+  \item collisionality, beta, flow shear, and numerical resolution.
+\end{itemize}
+
+\paragraph{Outputs.}
+These codes provide growth rates, mode frequencies, nonlinear heat and particle
+fluxes, fluctuation spectra, and field energies. For workflow purposes the most
+important outputs are the saturated heat and particle fluxes.
+
+\paragraph{How these outputs are used.}
+Those fluxes are precisely what a transport solver needs. They are also
+frequently used directly as optimization objectives. This is why GX is so
+useful inside optimization loops.
+
+\subsection{Trinity3D: whole-device profile evolution}
+
+\paragraph{What Trinity3D does.}
+Trinity3D advances radial density and temperature profiles using fluxes supplied
+by turbulence and neoclassical submodels \citep{TrinityDocs}.
+
+\paragraph{Governing equations.}
+In continuous form, the model is a 1D system of conservation laws:
+\begin{equation}
+\frac{\partial n_s}{\partial \tau}
++
+\mathcal{G}(\rho)\frac{\partial F_{n,s}}{\partial \rho}
+=
+S_{n,s},
+\end{equation}
+\begin{equation}
+\frac{\partial p_s}{\partial \tau}
++
+\mathcal{G}(\rho)\frac{\partial F_{p,s}}{\partial \rho}
+=
+\frac{2}{3}S_{p,s}.
+\end{equation}
+
+The current implementation advances a stacked profile vector $y$ with an
+implicit linearized update:
+\begin{equation}
+\left(d_1 I + \alpha\Psi\right)y^{m+1}
+=
+-d_0 y^m - d_{-1}y^{m-1}
++
+\alpha\Psi y^m
+-
+\alpha\left[G(F^+ - F^-) - S\right]
+-
+(1-\alpha)\left[G(F^+_m - F^-_m) - S_m\right].
+\end{equation}
+
+\paragraph{Inputs and outputs.}
+The code reads a TOML input specifying geometry, species profiles, source
+models, and transport submodels. In stellarator examples, the geometry is often
+VMEC, turbulence comes from GX, and neoclassical fluxes can come from SFINCS.
+The outputs are updated profiles, flux histories, and the coupled sub-run
+artifacts.
+
+\paragraph{How Trinity3D fits in the workflow.}
+This is typically the stage that turns local transport coefficients into a
+global profile prediction and hence into an updated pressure profile for the
+next equilibrium iteration.
+
+\subsection{NEOPAX: a reduced JAX neoclassical transport loop}
+
+\paragraph{What NEOPAX does.}
+NEOPAX builds a reduced neoclassical transport model from a MONKES-style
+database $D_{ij}(r,\nu,E_r)$ and evolves profiles with a JAX-native ODE solve
+\citep{NEOPAXRepo}.
+
+\paragraph{Governing equations.}
+The thermal transport coefficients are assembled into an $L_{ij}$ matrix, from
+which particle flux, heat flux, and parallel flow are computed:
+\begin{equation}
+\Gamma_a = -n_a\left(L_{11}A_1 + L_{12}A_2 + L_{13}A_3\right),
+\end{equation}
+\begin{equation}
+Q_a = -T_a n_a\left(L_{21}A_1 + L_{22}A_2 + L_{23}A_3\right),
+\end{equation}
+\begin{equation}
+U_{\parallel a}
+=
+-n_a\left(L_{31}A_1 + L_{32}A_2 + L_{33}A_3\right).
+\end{equation}
+
+The current implementation also forms an ambipolar electric-field source from
+the charge-flux imbalance, schematically
+\begin{equation}
+S_{E_r} \propto -\Gamma_e + \Gamma_D + \Gamma_T,
+\end{equation}
+and integrates the resulting radial evolution equations with \texttt{diffrax}.
+
+\paragraph{Inputs and outputs.}
+Inputs are a MONKES-style $D_{ij}$ database, geometry, species profiles, and
+edge conditions. Outputs include $E_r$, neoclassical particle and heat fluxes,
+and profile evolution histories.
+
+\paragraph{How NEOPAX fits in the workflow.}
+It can replace a more expensive full transport loop when a differentiable,
+reduced-order neoclassical model is preferable.
+
+\section{Which quantities are optimization targets and which are transport inputs?}
+
+This distinction is easy to miss and is crucial when building a black-box
+workflow:
+
+\begin{itemize}
+  \item \textbf{Geometry metrics} such as aspect ratio, boundary smoothness, or target rotational transform are equilibrium-stage objectives.
+  \item \textbf{Boozer-spectrum metrics} such as dominant symmetry-breaking $B_{mn}$ harmonics are usually optimization objectives and diagnostics.
+  \item \textbf{Effective ripple} $\epsilon_{\mathrm{eff}}$ is usually a direct objective or screening metric, not a transport variable that Trinity3D advances.
+  \item \textbf{SFINCS fluxes} are transport variables: they can directly feed Trinity3D or another transport solver.
+  \item \textbf{GX / GENE heat fluxes} are both optimization objectives and transport inputs.
+  \item \textbf{Bootstrap current} is a transport output that can become a new equilibrium input.
+\end{itemize}
+
+The user-supplied Mermaid chart reflects this correctly: some outputs are
+promoted to the next physics stage, while others are used only as optimization
+targets or screening diagnostics.
+
+\section{Why the final temperature and density profiles differ from the initial guesses}
+
+This is the central feedback mechanism in the workflow.
+
+The equilibrium calculation requires a pressure and current profile, but those
+profiles are often only a convenient starting point. Once neoclassical and
+turbulent transport are evaluated, the radial particle and heat fluxes tell us
+that the original profiles were not generally in balance with the sources and
+losses.
+
+The transport stage therefore updates:
+\begin{itemize}
+  \item species densities $n_s(r)$,
+  \item species temperatures $T_s(r)$,
+  \item the ambipolar electric field $E_r(r)$,
+  \item and sometimes the bootstrap-current contribution.
+\end{itemize}
+
+The total pressure is then
+\begin{equation}
+p(r) = \sum_s n_s(r)T_s(r),
+\end{equation}
+so when the transport solver changes $n_s$ and $T_s$, the equilibrium pressure
+profile changes too. If the bootstrap current changes appreciably, the current
+profile also changes, which can shift the equilibrium again.
+
+Thus a consistent design loop is
+\begin{equation}
+(R_{mn},Z_{mn},p,j)
+\rightarrow
+\text{equilibrium}
+\rightarrow
+\text{Boozer geometry}
+\rightarrow
+\text{transport fluxes}
+\rightarrow
+(n,T,E_r)
+\rightarrow
+(p_{\mathrm{new}},j_{\mathrm{new}})
+\rightarrow
+\text{equilibrium again}.
+\end{equation}
+
+\section{Examples from the literature}
+
+The workflow described here is not hypothetical. Several published studies
+already implement large parts of it:
+
+\begin{itemize}
+  \item \textbf{Precise quasi-symmetry optimization.}
+  Landreman and Paul optimized stellarator magnetic fields for extremely
+  precise quasi-symmetry, providing an archetypal example of equilibrium plus
+  Boozer plus orbit-confinement analysis \citep{LandremanPaul2022}.
+
+  \item \textbf{Direct turbulence optimization.}
+  Kim et al.\ coupled DESC and GX directly inside an optimization loop, using
+  nonlinear heat flux as an objective and Trinity3D for macroscopic profile
+  evaluation \citep{Kim2024TurbulenceOpt}. This is very close to the workflow
+  summarized in this repository.
+
+  \item \textbf{First-principles profile prediction.}
+  Bañón Navarro et al.\ coupled GENE-3D, KNOSOS, and a 1D transport solver to
+  produce first-principles profile predictions for optimized stellarators
+  \citep{BanonNavarro2023}. Although the specific neoclassical and transport
+  codes differ, the logic is the same as SFINCS + GENE / GX + Trinity3D or
+  NEOPAX.
+
+  \item \textbf{Fast neoclassical loops for optimization.}
+  MONKES was explicitly developed to make monoenergetic neoclassical
+  calculations fast enough for optimization loops \citep{Escoto2024MONKES}.
+\end{itemize}
+
+Taken together, these studies show that the remaining challenge is primarily
+software engineering: standard interfaces, reproducible containers, and an
+orchestration layer.
+
+\section{What a future containerized black-box workflow should standardize}
+
+If the end goal is a one-click workflow, the most important design choice is
+not the graphical interface but the contract between stages. The minimum useful
+contracts are:
+
+\begin{itemize}
+  \item an \textbf{equilibrium container} that accepts boundary and profile coefficients and emits a VMEC-compatible \texttt{wout} plus a small machine-readable summary,
+  \item a \textbf{Boozer container} that accepts \texttt{wout} and emits \texttt{boozmn} plus a summary of symmetry-breaking harmonics,
+  \item a \textbf{neoclassical container} that accepts Boozer geometry and profile gradients and emits $\epsilon_{\mathrm{eff}}$, bootstrap current, $E_r$, particle flux, and heat flux in a shared HDF5 schema,
+  \item a \textbf{turbulence container} that accepts geometry plus local profiles and emits heat and particle fluxes in a shared NetCDF or HDF5 schema,
+  \item a \textbf{transport container} that accepts those fluxes plus source models and emits updated profiles and fusion metrics.
+\end{itemize}
+
+That, rather than the physics itself, is the key engineering task for turning a
+research workflow into a black-box system.
+
+\bibliographystyle{plainnat}
+\bibliography{references}
+
+\end{document}
