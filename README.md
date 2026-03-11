@@ -23,6 +23,10 @@ The full manuscript, with governing equations and formal citations, is in
 [stellarator_workflow.pdf](stellarator_workflow.pdf). The source is in
 [stellarator_workflow.tex](stellarator_workflow.tex).
 
+A second standalone reference focused only on code interfaces is in
+[stellarator_io_reference.pdf](stellarator_io_reference.pdf). Its source is
+[stellarator_io_reference.tex](stellarator_io_reference.tex).
+
 ## From Fusion Energy to Stellarator Optimization
 
 The design problem has three layers:
@@ -228,6 +232,10 @@ exact code choices vary.
 - [stellarator_workflow.tex](stellarator_workflow.tex): full manuscript with
   equations and references.
 - [stellarator_workflow.pdf](stellarator_workflow.pdf): compiled PDF.
+- [stellarator_io_reference.tex](stellarator_io_reference.tex): standalone
+  input/output contract reference for the codes in the workflow.
+- [stellarator_io_reference.pdf](stellarator_io_reference.pdf): compiled I/O
+  reference PDF.
 - [references.bib](references.bib): bibliography used by the manuscript.
 
 Build the PDF locally with:

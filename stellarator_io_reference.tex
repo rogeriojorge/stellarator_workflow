@@ -1,0 +1,649 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+\usepackage{amsmath,amssymb,mathtools}
+\usepackage{booktabs,longtable,tabularx,array}
+\usepackage{enumitem}
+\usepackage[numbers,sort&compress]{natbib}
+\usepackage[colorlinks=true,linkcolor=blue,citecolor=blue,urlcolor=blue]{hyperref}
+
+\setlength{\parskip}{0.6em}
+\setlength{\parindent}{0pt}
+\setlist[itemize]{leftmargin=*}
+\setlist[enumerate]{leftmargin=*}
+
+\newcolumntype{L}[1]{>{\raggedright\arraybackslash}p{#1}}
+\newcommand{\code}[1]{\texttt{#1}}
+
+\title{Inputs and Outputs of Major Codes in a Stellarator Design Workflow}
+\author{stellarator\_workflow repository draft}
+\date{March 11, 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+This document isolates the software contracts that appear in a modern
+stellarator design loop. For each major code family it lists the main input
+artifacts, the main output artifacts, the subset of outputs that are normally
+handed to the next code in the pipeline, and the subset of outputs that are
+commonly used as optimization or design objectives. The emphasis is on the
+practical interfaces that connect VMEC or DESC equilibrium calculations to
+Boozer transforms, neoclassical solvers, gyrokinetic solvers, and global
+transport tools \citep{HirshmanWhitson1983,DudtKolemen2020,Boozer1983,Landreman2014SFINCS,Mandell2024GX,BanonNavarro2023}.
+\end{abstract}
+
+\tableofcontents
+
+\section{Purpose and conventions}
+
+The goal here is narrower than the main workflow manuscript. This document is
+about \emph{interfaces}: what each code expects to read, what it writes or
+returns, which outputs are consumed by the next stage, and which outputs are
+typically minimized, constrained, or monitored during stellarator optimization.
+
+Three conventions are used throughout:
+
+\begin{itemize}
+  \item ``Input'' means either an on-disk file accepted by the public CLI or a
+  public in-memory object accepted by the documented Python or JAX API.
+  \item ``Output'' means either a persisted artifact such as \code{wout\_*.nc},
+  \code{boozmn\_*.nc}, \code{sfincsOutput.h5}, or a documented result object
+  returned by a public API.
+  \item ``Optimization objective'' means a quantity that is commonly included
+  directly in an objective function or used as a screening metric, even when it
+  is \emph{not} passed to the next code in the transport loop.
+\end{itemize}
+
+The repository snapshots under \code{\_sources/} were used to verify the
+representative NetCDF and HDF5 schemas quoted below, so the tables are tied to
+actual artifacts rather than only to README summaries
+\citep{VMECRepo,VMECJaxRepo,DESCRepo,BoozXformRepo,BoozXformJaxRepo,NEORepo,NEOJaxRepo,SFINCSRepo,SFINCSJaxRepo,MONKESRepo,GXRepo,SpectraxGKRepo,TrinityDocs,NEOPAXRepo}.
+
+\section{Executive summary}
+
+\subsection{Pipeline hand-offs}
+
+{\small
+\begin{longtable}{L{0.14\linewidth}L{0.19\linewidth}L{0.28\linewidth}L{0.29\linewidth}}
+\caption{What each stage usually hands to the next stage.}
+\label{tab:handoffs}\\
+\toprule
+Code family & Main output artifact & Next code(s) & Subset usually handed forward \\
+\midrule
+\endfirsthead
+\toprule
+Code family & Main output artifact & Next code(s) & Subset usually handed forward \\
+\midrule
+\endhead
+VMEC / vmec\_jax &
+\code{wout\_*.nc} or in-memory wout-like object &
+BOOZ\_XFORM, booz\_xform\_jax, GX, Trinity3D, NEOPAX &
+equilibrium spectra and profiles, especially \code{rmnc}, \code{zmns},
+\code{lmns}, \code{bmnc}, \code{bsubumnc}, \code{bsubvmnc}, \code{iotas},
+\code{phi}, \code{phipf}, geometry scalars, and pressure / current profiles \\
+
+DESC &
+\code{*.h5} equilibrium family, plus optional exported VMEC or Boozer files &
+MONKES directly; otherwise the same downstream codes as VMEC after export &
+surface and equilibrium coefficients, pressure / iota / current profile
+parameters, and any exported \code{wout}- or \code{boozmn}-compatible file \\
+
+BOOZ\_XFORM /\\ booz\_xform\_jax &
+\code{boozmn\_*.nc} or in-memory Boozer object &
+NEO, NEO\_JAX, SFINCS, sfincs\_jax, MONKES, NEOPAX &
+Boozer field spectrum and radial profiles, especially \code{bmnc\_b},
+\code{ixm\_b}, \code{ixn\_b}, \code{iota\_b}, \code{buco\_b},
+\code{bvco\_b}, \code{phi\_b}, \code{phip\_b}, and the selected surface list \\
+
+NEO / NEO\_JAX &
+\code{neo\_out.*}, \code{neolog.*}, optional current / diagnostic files, or
+in-memory surface results &
+usually no direct transport consumer &
+usually none; optional current-related outputs may be fed into outer current or
+equilibrium updates \\
+
+SFINCS / sfincs\_jax &
+\code{sfincsOutput.h5}, optional \code{.npy} state or transport-matrix dumps &
+Trinity3D or an outer equilibrium / transport loop &
+most often \code{particleFlux\_vm\_rN} and \code{heatFlux\_vm\_rN}; if
+\code{includePhi1} is enabled in the Trinity3D adapter, the hand-off becomes
+\code{particleFlux\_vd\_rN} and \code{heatFlux\_vd\_rN}; bootstrap-current and
+\code{E\_r} information may also be reused \\
+
+MONKES &
+in-memory \code{Dij}, \code{f}, \code{s}, or an HDF5 monoenergetic database &
+NEOPAX &
+for today's NEOPAX reader the effective hand-off is the reduced database:
+\code{D11}, \code{D13}, \code{D33}, \code{Er}, \code{Er\_tilde},
+\code{drds}, \code{rho}, and \code{nu\_v} \\
+
+GENE / GENE-3D &
+installation-specific output files or restart / diagnostic datasets &
+Trinity3D-like profile solvers, validation workflows &
+usually species heat and particle fluxes; in linear studies only
+\(\gamma\) and \(\omega\) may be kept \\
+
+GX &
+\code{run\_name.out.nc}, \code{run\_name.nc}, \code{run\_name.big.nc},
+\code{run\_name.restart.nc} &
+Trinity3D &
+steady estimates of particle and heat flux, read in the present Trinity3D
+adapter from either \code{Diagnostics/ParticleFlux\_st} and
+\code{Diagnostics/HeatFlux\_st} or from \code{Fluxes/pflux} and
+\code{Fluxes/qflux}; zeta-resolved stellarator runs can also use
+\code{ParticleFlux\_zst} and \code{HeatFlux\_zst} \\
+
+SPECTRAX-GK &
+in-memory diagnostics and optional CSV / plot outputs &
+outer optimization or a transport wrapper &
+the natural hand-off is the same turbulent contract as GX:
+\code{gamma}, \code{omega}, heat-flux traces, and particle-flux traces \\
+
+Trinity3D &
+\code{*.nc}, \code{*.bp}, \code{*.log.npy}, \code{*.out} &
+VMEC or DESC in the next outer iteration &
+updated density and temperature profiles, hence an updated pressure profile;
+in some workflows bootstrap-related current information is also recycled \\
+
+NEOPAX &
+in-memory \code{Lij}, \code{Gamma}, \code{Q}, \code{Upar}; solved profile
+states; optional HDF5 outputs &
+VMEC or DESC in the next outer iteration &
+updated \code{E\_r(r)}, neoclassical fluxes, and pressure or current-related
+profiles from the reduced transport solve \\
+\bottomrule
+\end{longtable}
+}
+
+\subsection{Outputs commonly used as objectives}
+
+{\small
+\begin{longtable}{L{0.16\linewidth}L{0.42\linewidth}L{0.23\linewidth}}
+\caption{Outputs commonly used as stellarator optimization or design objectives.}
+\label{tab:objectives}\\
+\toprule
+Code family & Outputs commonly used in objectives & Also a direct transport input? \\
+\midrule
+\endfirsthead
+\toprule
+Code family & Outputs commonly used in objectives & Also a direct transport input? \\
+\midrule
+\endhead
+VMEC / vmec\_jax &
+aspect ratio, volume, \(\beta\), rotational-transform targets, magnetic-well /
+Mercier-related metrics, boundary smoothness, equilibrium existence / residual
+quality &
+indirectly; the equilibrium itself is the upstream state for later codes \\
+
+DESC &
+quasisymmetry error, geometry constraints, aspect ratio, volume, rotational
+transform, force-balance residuals, differentiable proxy objectives &
+indirectly; exported equilibria feed the rest of the workflow \\
+
+BOOZ\_XFORM / booz\_xform\_jax &
+non-target Boozer harmonics, symmetry-breaking spectrum, mirror terms,
+quasisymmetry error in Boozer coordinates &
+usually no; mainly a geometry diagnostic and interface layer \\
+
+NEO / NEO\_JAX &
+\(\epsilon_{\mathrm{eff}}\), class-resolved effective ripple, trapped-particle
+screening metrics, current proxies &
+usually no \\
+
+SFINCS / sfincs\_jax &
+neoclassical particle flux, heat flux, bootstrap current, ambipolar
+\(E_r\), \(\Phi_1\), transport matrices &
+yes \\
+
+MONKES &
+monoenergetic \(D_{ij}\) coefficients and their sensitivity to radius,
+collisionality, and \(E_r\) &
+yes, through reduced neoclassical models such as NEOPAX \\
+
+GENE / GENE-3D &
+linear growth rates and frequencies, nonlinear heat and particle fluxes,
+transport stiffness &
+nonlinear fluxes yes; linear rates usually no \\
+
+GX &
+linear \(\gamma\) and \(\omega\), nonlinear heat flux, particle flux, free
+energy, stiffness &
+yes for heat and particle flux \\
+
+SPECTRAX-GK &
+\code{gamma}, \code{omega}, \code{heat\_flux}, \code{particle\_flux},
+\code{Wg}, \code{Wphi} &
+yes once wrapped into a transport loop \\
+
+Trinity3D &
+\code{Pfus\_MW}, \code{Qfus}, \code{Paux\_MW}, transport-consistent
+\(n(r)\), \(T(r)\), and \(\beta\) &
+it is already the global transport stage \\
+
+NEOPAX &
+ambipolar \(E_r\), bootstrap current, toroidal current, neoclassical fluxes,
+reduced-order profile predictions &
+yes \\
+\bottomrule
+\end{longtable}
+}
+
+\section{Code-by-code reference}
+
+\subsection{VMEC and vmec\_jax}
+
+\paragraph{Role.}
+VMEC solves the fixed-boundary ideal-MHD equilibrium; \code{vmec\_jax}
+preserves essentially the same physical contract while exposing a JAX-native,
+differentiable API \citep{HirshmanWhitson1983,VMECRepo,VMECJaxRepo}.
+
+\paragraph{Primary inputs.}
+The canonical VMEC input is \code{input.NAME}. The core design variables are
+the boundary Fourier coefficients \code{RBC(m,n)} and \code{ZBS(m,n)}, plus
+pressure coefficients \code{AM} or the auxiliary pressure arrays
+\code{AM\_AUX\_*}. Either rotational transform or current is prescribed through
+\code{AI}, \code{AC}, and their auxiliary arrays. The magnetic scale is set by
+\code{PHIEDGE}. Resolution and solver controls include \code{NS},
+\code{MPOL}, \code{NTOR}, iteration budgets, and tolerance arrays. The JAX
+version accepts the same input file and additionally supports in-memory resume
+state and solver options.
+
+\paragraph{Primary outputs.}
+The main output is \code{wout\_*.nc}. Verified example files contain scalar
+geometry and convergence quantities such as \code{aspect}, \code{Aminor\_p},
+\code{Rmajor\_p}, \code{volume\_p}, \code{betatotal}, \code{b0},
+\code{volavgB}, \code{fsqr}, \code{fsqz}, and \code{fsql}. The radial-profile
+outputs include \code{presf}, \code{pres}, \code{phi}, \code{phipf},
+\code{chi}, \code{chipf}, \code{iotas}, \code{iotaf}, \code{q\_factor},
+\code{jcuru}, \code{jcurv}, \code{buco}, and \code{bvco}. The spectral
+geometry is stored in arrays such as \code{rmnc}, \code{zmns}, \code{lmns},
+\code{bmnc}, \code{gmnc}, \code{bsubumnc}, \code{bsubvmnc},
+\code{bsubsmns}, \code{currumnc}, and \code{currvmnc}. The JAX API also
+returns a \code{FixedBoundaryRun} object containing the solver state, flux
+profiles, and a wout-like in-memory representation.
+
+\paragraph{Subset handed to the next code.}
+BOOZ\_XFORM and \code{booz\_xform\_jax} need the full equilibrium spectrum and
+profiles encoded in \code{wout\_*.nc}. GX, Trinity3D, and NEOPAX geometry
+readers also consume \code{wout}-level data rather than only high-level
+scalars, because they need field-line geometry, the rotational transform, and
+surface metrics.
+
+\paragraph{Subset used as objectives.}
+Common direct objectives are aspect ratio, volume, \(\beta\), target
+\(\iota(s)\), and equilibrium-quality metrics. The residual scalars
+\code{fsqr}, \code{fsqz}, and \code{fsql} are mainly QA signals rather than
+physics design objectives.
+
+\subsection{DESC}
+
+\paragraph{Role.}
+DESC is a differentiable pseudo-spectral equilibrium and optimization suite
+\citep{DudtKolemen2020,Panici2023,Conlin2023,Dudt2023QS,DESCRepo}.
+
+\paragraph{Primary inputs.}
+DESC accepts an input file or Python configuration specifying the surface
+representation, field period, toroidal flux, pressure profile, and either iota
+or current profile, together with spectral resolution, continuation settings,
+and optimizer options. It can also import VMEC-like inputs and outputs.
+
+\paragraph{Primary outputs.}
+The standard serialized output is \code{*.h5} or \code{*.pkl}. Example HDF5
+equilibrium families contain groups such as \code{\_equilibria/*} with the
+spectral coefficients \code{\_R\_lmn}, \code{\_Z\_lmn}, \code{\_L\_lmn},
+surface and axis descriptions, toroidal flux \code{\_Psi}, and saved pressure
+and iota profile parameters under \code{\_pressure/\_params} and
+\code{\_iota/\_params}. DESC can also export VMEC-style or
+BOOZ\_XFORM-compatible files through its VMEC utilities.
+
+\paragraph{Subset handed to the next code.}
+If the next code expects VMEC input, the hand-off is an exported \code{wout}.
+If the next code expects Boozer data, DESC can provide a \code{boozmn}-style
+file or a direct in-memory field object. MONKES can consume DESC-derived field
+objects directly, while VMEC-centric tools usually rely on exported
+\code{wout}-compatible data.
+
+\paragraph{Subset used as objectives.}
+DESC is itself commonly the optimization host, so quasisymmetry error, aspect
+ratio, volume, iota targets, boundary regularity, and force-balance residuals
+are often objectives. Once coupled to GX or another turbulent model, turbulent
+transport metrics become part of the same objective stack.
+
+\subsection{BOOZ\_XFORM and booz\_xform\_jax}
+
+\paragraph{Role.}
+These tools transform a VMEC-like equilibrium into Boozer coordinates
+\citep{Boozer1983,BoozXformRepo,BoozXformJaxRepo}.
+
+\paragraph{Primary inputs.}
+The legacy route is a VMEC \code{wout\_*.nc} file plus an \code{in\_booz.*}
+control file specifying resolution and the list of radial surfaces to compute.
+The JAX version also accepts an in-memory wout-like object.
+
+\paragraph{Primary outputs.}
+The standard file output is \code{boozmn\_*.nc}. Verified examples contain
+\code{iota\_b}, \code{pres\_b}, \code{beta\_b}, \code{phip\_b},
+\code{phi\_b}, \code{bvco\_b}, \code{buco\_b}, \code{jlist}, mode lists
+\code{ixm\_b} and \code{ixn\_b}, and Fourier arrays \code{bmnc\_b},
+\code{rmnc\_b}, \code{zmns\_b}, \code{pmns\_b}, and \code{gmn\_b}. The JAX
+API also holds Boozer \(I\) and \(G\) profiles and the selected radial grid in
+memory.
+
+\paragraph{Subset handed to the next code.}
+NEO and NEO\_JAX need the Boozer spectrum and its radial profiles. SFINCS and
+\code{sfincs\_jax} use the same Boozer geometry when running in a Boozer-based
+geometry mode. MONKES and NEOPAX use the Boozer spectrum through direct field
+or file readers.
+
+\paragraph{Subset used as objectives.}
+The most common design outputs are the non-target Boozer harmonics in
+\code{bmnc\_b}, or equivalent symmetry-breaking measures built from them. These
+are geometry objectives, not state variables advanced by a transport solver.
+
+\subsection{NEO and NEO\_JAX}
+
+\paragraph{Role.}
+NEO computes effective ripple and related trapped-particle diagnostics from
+Boozer data \citep{Nemov1999,Nemov2008,NEORepo,NEOJaxRepo}.
+
+\paragraph{Primary inputs.}
+The standard inputs are a \code{boozmn\_*.nc} file and a control file such as
+\code{neo\_param.ext} or \code{neo\_in.ext}. The control file sets the surface
+list, angular resolution (\code{theta\_n}, \code{phi\_n}), Fourier cutoffs,
+Monte Carlo controls, accuracy targets, and switches for current calculation
+and optional extra file dumps. NEO\_JAX also exposes a direct Python or JAX API
+that returns structured result objects.
+
+\paragraph{Primary outputs.}
+The legacy outputs are \code{neo\_out.*} and \code{neolog.*}, plus optional
+\code{neo\_cur.*}, \code{current.dat}, \code{conver.dat},
+\code{diagnostic.dat}, \code{diagnostic\_add.dat}, and
+\code{diagnostic\_bigint.dat}. The principal physics quantities are
+\code{epstot} \((=\epsilon_{\mathrm{eff}}^{3/2})\), \code{epspar},
+\code{reff}, \code{iota}, \code{b\_ref}, \code{r\_ref}, \code{ctrone},
+\code{ctrtot}, \code{bareph}, \code{barept}, and \code{yps}. In NEO\_JAX
+these appear in result objects under names such as
+\code{epsilon\_effective} and \code{epsilon\_effective\_by\_class}.
+
+\paragraph{Subset handed to the next code.}
+Usually none. In most workflows NEO is a screening or optimization branch, not
+a transport branch. If \code{CALC\_CUR=1}, current-related outputs can be fed
+into a broader outer loop, but that is not the default Trinity3D hand-off.
+
+\paragraph{Subset used as objectives.}
+\(\epsilon_{\mathrm{eff}}\) and its class-resolved pieces are classic
+stellarator screening objectives. This is precisely the case in which a code's
+output is central to optimization but not central to profile evolution.
+
+\subsection{SFINCS and sfincs\_jax}
+
+\paragraph{Role.}
+SFINCS solves the radially local drift-kinetic equation for neoclassical
+transport in non-axisymmetric plasmas \citep{Landreman2014SFINCS,Mollen2018,SFINCSRepo,SFINCSJaxRepo}.
+
+\paragraph{Primary inputs.}
+The main input is \code{input.namelist}. In current public interfaces the key
+groups are \code{general}, \code{geometryParameters},
+\code{speciesParameters}, \code{physicsParameters},
+\code{resolutionParameters}, \code{otherNumericalParameters},
+\code{preconditionerOptions}, and optional \code{export\_f} settings. Together
+they define the geometry source, radial coordinate, species charges and masses,
+\(\hat n_s\), \(\hat T_s\), their gradients, the collision model,
+electric-field terms, \(\Phi_1\) switches, and numerical resolution.
+
+\paragraph{Primary outputs.}
+The standard output is \code{sfincsOutput.h5}. Verified example files include
+geometry snapshots, copied input metadata, and the following reusable transport
+datasets:
+\begin{itemize}
+  \item \code{particleFlux\_vm\_psiHat}
+  \item \code{particleFlux\_vm\_psiN}
+  \item \code{particleFlux\_vm\_rHat}
+  \item \code{particleFlux\_vm\_rN}
+  \item \code{heatFlux\_vm\_psiHat}
+  \item \code{heatFlux\_vm\_psiN}
+  \item \code{heatFlux\_vm\_rHat}
+  \item \code{heatFlux\_vm\_rN}
+  \item additional transport state: matching momentum-flux arrays, classical
+  fluxes, \code{FSABjHat}, \code{FSABFlow}, \code{Phi1Hat}, and
+  \code{transportMatrix}.
+\end{itemize}
+Optional exports include full-\(f\), \(\delta f\), and \code{*\_vs\_x}
+lineouts. The JAX interface additionally exposes in-memory result dictionaries
+and can write \code{.npy} state vectors or transport matrices from its CLI.
+
+\paragraph{Subset handed to the next code.}
+The present Trinity3D adapter reads \code{particleFlux\_vm\_rN} and
+\code{heatFlux\_vm\_rN} when \code{includePhi1} is off, and
+\code{particleFlux\_vd\_rN} and \code{heatFlux\_vd\_rN} when it is on. In
+other workflows \code{FSABjHat}, ambipolar electric-field information, and the
+transport matrix are also reused by an outer iteration.
+
+\paragraph{Subset used as objectives.}
+Neoclassical particle flux, heat flux, bootstrap current, ambipolar \(E_r\),
+and \(\Phi_1\)-related quantities are all common optimization metrics. Unlike
+\(\epsilon_{\mathrm{eff}}\), many of these are also direct transport inputs.
+
+\subsection{MONKES}
+
+\paragraph{Role.}
+MONKES is a fast JAX monoenergetic drift-kinetic solver
+\citep{Escoto2024MONKES,MONKESRepo}.
+
+\paragraph{Primary inputs.}
+The public API constructs a field object from a DESC equilibrium or an
+equivalent magnetic representation, then solves at a chosen radius with a
+species list, radial electric field, particle speed, and pitch-angle
+resolution. In database-building use, the same solve is repeated over
+collisionality and \(E_r\) grids.
+
+\paragraph{Primary outputs.}
+The core output is the monoenergetic transport matrix \code{Dij}, together with
+the perturbed distribution function \code{f} and source array \code{s}. In a
+database context these are stored as HDF5 arrays such as \code{D11},
+\code{D13}, \code{D31}, \code{D33}, \code{rho}, \code{nu\_v}, \code{Er},
+\code{Er\_tilde}, \code{Es}, and geometric conversion factors.
+
+\paragraph{Subset handed to the next code.}
+NEOPAX's public database reader currently consumes the reduced subset
+\code{D11}, \code{D13}, \code{D33}, \code{Er}, \code{Er\_tilde},
+\code{drds}, \code{rho}, and \code{nu\_v}. The full distribution function
+\code{f} and source term \code{s} are useful for analysis but are not part of
+that hand-off.
+
+\paragraph{Subset used as objectives.}
+MONKES is often used to build cheap neoclassical surrogates. In that role the
+\code{Dij} coefficients themselves are optimization or screening targets.
+
+\subsection{GENE and GENE-3D}
+
+\paragraph{Role.}
+GENE and GENE-3D provide high-fidelity gyrokinetic turbulence calculations in
+flux-tube and global settings \citep{Gorler2011GENE,Merz2012GENE,Xanthopoulos2020GENE3D,GENEWebsite}.
+
+\paragraph{Primary inputs.}
+The stable physics contract is clear even though the exact file syntax is not
+publicly standardized across installations: geometry derived from VMEC or
+Boozer coordinates, species densities and temperatures, radial gradients,
+collision parameters, electromagnetic switches, and numerical-grid settings.
+For stellarator flux-tube workflows the geometry usually passes through a
+stellarator interface layer before reaching GENE.
+
+\paragraph{Primary outputs.}
+The usual outputs are linear growth rates, real frequencies, eigenfunctions,
+and nonlinear species heat and particle fluxes together with spectra and time
+histories. The exact filenames are installation-dependent, so the important
+contract is the variable-level one rather than a specific disk layout.
+
+\paragraph{Subset handed to the next code.}
+For transport coupling, the critical hand-off is the turbulent flux vector. For
+screening, only linear \(\gamma\) and \(\omega\) may be retained.
+
+\paragraph{Subset used as objectives.}
+Linear growth rates are often used for rapid pruning; nonlinear heat flux,
+particle flux, and stiffness are higher-fidelity design objectives.
+
+\subsection{GX}
+
+\paragraph{Role.}
+GX is a GPU-native gyrokinetic code with a workflow that is especially suitable
+for repeated turbulent-transport evaluations inside design loops
+\citep{Mandell2018,Mandell2024GX,GXRepo}.
+
+\paragraph{Primary inputs.}
+GX is run with \code{gx run\_name.in}. The input file controls geometry,
+species, domain, time stepping, diagnostics, restart behavior, and numerical
+resolution. Stellarator calculations can use VMEC-driven geometry or imported
+field-line geometry, and the diagnostics flags \code{omega=true} and
+\code{fluxes=true} determine whether growth-rate and flux diagnostics are
+written.
+
+\paragraph{Primary outputs.}
+Linear runs write \code{run\_name.out.nc}. Nonlinear runs write
+\code{run\_name.nc}. Saved-field diagnostics may also produce
+\code{run\_name.big.nc}. Restart output uses \code{run\_name.restart.nc}.
+Verified NetCDF outputs contain groups such as \code{Grids},
+\code{Geometry}, \code{Diagnostics}, and \code{Inputs}. The
+public docs show linear growth-rate diagnostics under
+\code{Special/omega\_v\_time}. The present Trinity3D adapter reads flux data
+from \code{Diagnostics/ParticleFlux\_st},
+\code{Diagnostics/HeatFlux\_st}, their zeta-resolved variants, or from the
+\code{Fluxes/pflux} and \code{Fluxes/qflux} groups when present.
+
+\paragraph{Subset handed to the next code.}
+Trinity3D uses steady estimates of the heat and particle fluxes at each radius.
+It obtains flux Jacobians by rerunning GX on perturbed gradients and finite
+differencing those outputs.
+
+\paragraph{Subset used as objectives.}
+Ion and electron heat flux are common direct objectives. Linear
+\(\gamma\) and \(\omega\) are also used for screening. In turbulence-aware
+optimization, heat flux is both an objective and a transport input.
+
+\subsection{SPECTRAX-GK}
+
+\paragraph{Role.}
+SPECTRAX-GK is a JAX-native gyrokinetic solver aimed at differentiability and
+rapid experimentation \citep{SpectraxGKRepo}.
+
+\paragraph{Primary inputs.}
+The current public interface is config-driven. A TOML config specifies grid,
+geometry, physics toggles, and time integration. Geometry can be analytic or
+imported from a GX-style \code{*.eik.nc} file, including VMEC-derived geometry.
+
+\paragraph{Primary outputs.}
+The natural outputs are JAX-native result objects with \code{gamma},
+\code{omega}, and time traces such as \code{gamma\_t}, \code{omega\_t},
+\code{Wg\_t}, \code{Wphi\_t}, \code{Wapar\_t}, \code{heat\_flux\_t}, and
+\code{particle\_flux\_t}. The nonlinear CLI can also save a CSV with compact
+columns for time, growth rate, frequency, free energy, and species-resolved
+heat and particle flux.
+
+\paragraph{Subset handed to the next code.}
+The natural downstream contract is the same one used by GX: turbulent heat and
+particle flux, and optionally linear \(\gamma\) and \(\omega\). In the current
+public repository this is primarily an optimization or validation interface
+rather than a fixed Trinity3D adapter.
+
+\paragraph{Subset used as objectives.}
+Growth rate, real frequency, turbulent heat flux, particle flux, and free
+energy are all exposed directly and are therefore natural differentiable
+objective components.
+
+\subsection{Trinity3D}
+
+\paragraph{Role.}
+Trinity3D is a global transport solver that evolves density and temperature
+profiles and computes whole-device power metrics \citep{TrinityDocs,BanonNavarro2023}.
+
+\paragraph{Primary inputs.}
+The main input is a TOML-style \code{*.in} file with groups such as
+\code{[grid]}, \code{[time]}, one or more \code{[[model]]} blocks,
+\code{[[species]]}, \code{[geometry]}, \code{[physics]}, and \code{[log]}.
+Geometry can be read from a VMEC \code{wout}. Turbulence and neoclassical
+models add their own inputs, for example \code{gx\_template} and
+\code{gx\_outputs} for GX coupling.
+
+\paragraph{Primary outputs.}
+Trinity3D writes NetCDF, ADIOS2, NumPy-log, and text-log outputs. Verified
+NetCDF outputs contain geometry groups with \code{B0}, \code{Btor},
+\code{a\_minor}, \code{R\_major}, \code{area}, and \code{grho}; profile
+histories such as \code{n\_e}, \code{T\_e}, \code{n\_H}, \code{T\_H}; total
+and model-labelled fluxes \code{pflux\_*} and \code{qflux\_*}; gradients
+\code{aLn\_*}, \code{aLT\_*}; source histories \code{Sn\_*} and \code{Sp\_*};
+and whole-device metrics such as \code{beta\_vol}, \code{Paux\_MW},
+\code{Palpha\_int\_MW}, \code{Pfus\_MW}, and \code{Qfus}.
+
+\paragraph{Subset handed to the next code.}
+The essential outer-loop hand-off is the updated profile state:
+\(n_s(r)\), \(T_s(r)\), and therefore \(p(r)\). That pressure profile is what
+must be sent back to VMEC or DESC if the loop is to be closed
+self-consistently. When current evolution is modeled, bootstrap-related current
+information can also be recycled into the next equilibrium solve.
+
+\paragraph{Subset used as objectives.}
+\code{Pfus\_MW}, \code{Qfus}, \code{Paux\_MW}, \(\beta\), and the final
+transport-consistent profiles are end-of-pipeline design metrics.
+
+\subsection{NEOPAX}
+
+\paragraph{Role.}
+NEOPAX is a JAX framework for reduced neoclassical transport and profile
+evolution \citep{NEOPAXRepo}.
+
+\paragraph{Primary inputs.}
+Public examples build NEOPAX from three inputs: a VMEC \code{wout}, a Boozer
+\code{boozmn}, and a MONKES-like monoenergetic database. The database reader
+currently expects HDF5 datasets such as \code{D11}, \code{D13}, \code{D33},
+\code{Er}, \code{Er\_tilde}, \code{drds}, \code{rho}, and \code{nu\_v}. The
+profile state can be loaded from NTSS-like HDF5 files with arrays such as
+\code{r}, \code{Er}, \code{Te}, \code{ne}, \code{Pressure}, \code{I\_bs}, and
+related transport quantities, or assembled directly in memory.
+
+\paragraph{Primary outputs.}
+The core neoclassical API returns \code{Lij}, \code{Gamma}, \code{Q}, and
+\code{Upar}. Example HDF5 outputs range from a minimal \code{Er\_Test.h5}
+containing \code{rho}, \code{Er}, and \code{Jboots}, to larger NTSS-style
+profile files containing arrays such as \code{Pressure}, \code{FluxNeo},
+\code{FluxQe}, \code{FluxQi}, \code{AmbiFlux}, \code{J\_bs}, \code{I\_bs},
+\code{I\_tor}, \code{beta}, \code{Te}, \code{TD}, \code{Tt}, \code{ne},
+\code{nD}, and \code{nHe}.
+
+\paragraph{Subset handed to the next code.}
+In an outer loop the practical hand-off is the reduced transport state:
+\code{Er(r)}, neoclassical fluxes, and any updated pressure or current
+profiles. NEOPAX also contains turbulence-coupling utilities, but the public
+examples center on the neoclassical reduced model.
+
+\paragraph{Subset used as objectives.}
+Ambipolar electric field, bootstrap current, toroidal current, neoclassical
+fluxes, and reduced-order profile predictions are all candidate objective
+components or screening metrics.
+
+\section{The two most important distinctions}
+
+Two distinctions repeatedly matter in stellarator workflow design:
+
+\begin{enumerate}
+  \item Some outputs are \emph{screening objectives only}. The clearest example
+  is NEO's \(\epsilon_{\mathrm{eff}}\): it is central to ranking candidate
+  geometries, but it is usually not what Trinity3D advances in time.
+  \item Some outputs are \emph{both objectives and state hand-offs}. The
+  clearest examples are turbulent heat and particle flux from GX, GENE, or
+  SPECTRAX-GK, and neoclassical flux from SFINCS. These quantities are often
+  minimized in optimization and are also the direct inputs needed to evolve
+  density and temperature profiles.
+\end{enumerate}
+
+That distinction is what determines whether a future containerized black-box
+workflow needs a result only for ranking, or whether it needs a robust,
+machine-readable interface that another code must parse automatically.
+
+\bibliographystyle{plainnat}
+\bibliography{references}
+
+\end{document}

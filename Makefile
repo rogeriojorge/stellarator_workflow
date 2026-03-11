@@ -1,16 +1,15 @@
-PDF=stellarator_workflow.pdf
-TEX=stellarator_workflow.tex
+PDFS=stellarator_workflow.pdf stellarator_io_reference.pdf
 BIB=references.bib
 
 .PHONY: all clean
 
-all: $(PDF)
+all: $(PDFS)
 
-$(PDF): $(TEX) $(BIB)
-	pdflatex -interaction=nonstopmode $(TEX)
-	bibtex stellarator_workflow
-	pdflatex -interaction=nonstopmode $(TEX)
-	pdflatex -interaction=nonstopmode $(TEX)
+%.pdf: %.tex $(BIB)
+	pdflatex -interaction=nonstopmode $<
+	bibtex $(basename $<)
+	pdflatex -interaction=nonstopmode $<
+	pdflatex -interaction=nonstopmode $<
 
 clean:
 	rm -f *.aux *.bbl *.blg *.fdb_latexmk *.fls *.log *.out *.toc
